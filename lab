@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# lab: black-box lab for agent tools (MEGA S04E01 build guide, "The Lab").
+# Workspace: Herdr. Harness: Claude Code. Depends on nothing else.
+#
+#   lab doctor                         check Herdr, Claude Code and the lab before a run
+#   lab start [--project DIR] [--tool PATH]...
+#                                      ISOLATE: a second Herdr session + a clean project copy
+#   lab hc <herdr command...>          DRIVE: a herdr command sent ONLY to the lab session
+#   lab status                         show what is running
+#   lab test <scenarios.md> <N>        run check number N from a scenarios file, write a report
+#   lab run "<what to try>"            run one check described in a sentence
+#   lab stop                           close only what the lab started, list anything left behind
+#   lab --help
+#
+# Options for test/run:
+#   --tester-model M   model of the lab agent, the judge (default: sonnet)
+#   --agent-model M    model of the harness under test, started as lab-claude (default: haiku)
+#   --keep             leave the lab running after the check
+#
+# Examples:
+#   lab doctor
+#   lab test lab-scenarios.md 1
+#   lab start --project ~/code/app --tool ~/tools/split && lab test lab-scenarios.md 3 --keep
+#   lab run "Open a pane, run 'echo hi', read the pane. Expect the text hi."
+#   lab stop
+set -u
+
+LAB_DIR="$(cd "$(dirname "$0")" && pwd)"   # where this script, tester.md and report.py live
+LAB_HOME="$HOME/.lab"                        # everything a run creates; removed on stop
+STATE="$LAB_HOME/state.env"
+CONFIG="$LAB_HOME/config.toml"
+BIN="$LAB_HOME/bin"
+SCREENS="$LAB_HOME/screens.log"
+
+die() { echo "lab: $*" >&2; exit 1; }
+
+# Trap from the build guide: an inherited socket sends commands to the daily workspace.
+# Every command for the lab goes through clean(), which drops the parent's address and ids.
+clean() {
+  env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_SESSION \
+      -u HERDR_WORKSPACE_ID -u HERDR_TAB_ID -u HERDR_PANE_ID "$@"
+}
+lab_herdr() { clean HERDR_SESSION="$SESSION" HERDR_CONFIG_PATH="$CONFIG" herdr "$@"; }
+
+running() { [ -f "$STATE" ]; }
+load_state() {
+  running || die "the lab is not running. Start it with: lab start"
+  # shellcheck disable=SC1090
+  . "$STATE"
+}
+
+cmd_help() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
+
+cmd_doctor() {
+  local bad=0
+  check() { if eval "$2" >/dev/null 2>&1; then echo "  ok    $1"; else echo "  FAIL  $1"; bad=1; fi; }
+  check "inside a Herdr pane (HERDR_ENV=1)"                    '[ "${HERDR_ENV:-}" = 1 ]'
+  check "herdr on PATH: $(herdr --version 2>/dev/null)"        'command -v herdr'
+  check "claude on PATH: $(claude --version 2>/dev/null)"      'command -v claude'
+  check "jq, python3, rsync, git on PATH"                      'command -v jq && command -v python3 && command -v rsync && command -v git'
+  check "tester.md and report.py next to this script"          '[ -f "$LAB_DIR/tester.md" ] && [ -f "$LAB_DIR/report.py" ]'
+  check "herdr accepts a lab config with allow_nested"         'd=$(mktemp -d) && printf "[experimental]\nallow_nested = true\n" > "$d/c.toml" && clean HERDR_CONFIG_PATH="$d/c.toml" herdr config check; r=$?; rm -rf "$d"; [ $r = 0 ]'
+  if [ "${1:-}" = --login ]; then
+    # Costs one tiny model call, so it only runs when asked for.
+    check "claude answers without my user settings (login reused)" 'd=$(mktemp -d) && (cd "$d" && claude -p "Reply with: ok" --model haiku --setting-sources project,local --strict-mcp-config --disable-slash-commands | grep -qi ok); r=$?; rm -rf "$d"; [ $r = 0 ]'
+  else
+    echo "  skip  claude login in the lab (run: lab doctor --login, one small model call)"
+  fi
+  if running; then . "$STATE"; echo "  info  lab is running: session $SESSION, tab $OUTER_TAB"; else echo "  info  lab is not running"; fi
+  # A lab session left behind by a crashed run shows up here.
+  local stale; stale=$(clean herdr session list --json 2>/dev/null | jq -r '.sessions[] | select(.name | startswith("lab-")) | .name' | grep -v "^${SESSION:-none}$")
+  [ -n "$stale" ] && { echo "  WARN  lab sessions with no state file: $stale (remove with: herdr session stop <name>; herdr session delete <name>)"; }
+  [ $bad = 0 ] && echo "doctor: ready" || echo "doctor: not ready"
+  return $bad
+}
+
+cmd_start() {
+  [ "${HERDR_ENV:-}" = 1 ] || die "run this from a Herdr pane"
+  running && die "the lab is already running. Stop it first: lab stop"
+  local project="" tools=() agent_model="haiku"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project)     project="${2:?give a directory}"; shift 2 ;;
+      --tool)        tools+=("${2:?give a path}"); shift 2 ;;
+      --agent-model) agent_model="${2:?give a model}"; shift 2 ;;
+      *) die "unknown option for start: $1" ;;
+    esac
+  done
+
+  local copy="$LAB_HOME/project"
+  mkdir -p "$copy" "$BIN" "$LAB_HOME/tester"
+  : > "$SCREENS"
+
+  # Nested Herdr is off by default; it is allowed only in the lab's own config.
+  printf '[experimental]\nallow_nested = true\n' > "$CONFIG"
+  clean HERDR_CONFIG_PATH="$CONFIG" herdr config check >/dev/null || die "the lab config fails 'herdr config check'"
+
+  # A clean copy: tracked files only, no .git, no secrets, no agent or expectations files,
+  # so the agent under test cannot read its own test.
+  if [ -n "$project" ]; then
+    git -C "$project" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$project is not a git repository"
+    project="$(cd "$project" && git rev-parse --show-toplevel)"
+    copy="$LAB_HOME/$(basename "$project")"; mkdir -p "$copy"
+    git -C "$project" ls-files -z \
+      | grep -zvE '(^|/)(agents/|expectations\.md$|lab-scenarios\.md$|lab-reports/|\.env|\.dev\.vars|.*\.pem$|.*\.key$|vars\.json$)' \
+      | rsync -a --from0 --files-from=- "$project/" "$copy/" || die "could not copy $project"
+  fi
+
+  # The harness under test. It reuses my login but none of my user settings (hooks, MCP servers).
+  # A separate CLAUDE_CONFIG_DIR would be cleaner, but then Claude Code is not logged in.
+  cat > "$BIN/lab-claude" <<EOF
+#!/usr/bin/env bash
+exec "$(command -v claude)" --setting-sources project,local --strict-mcp-config --model "\${LAB_AGENT_MODEL:-$agent_model}" "\$@"
+EOF
+  chmod +x "$BIN/lab-claude"
+  # Only the tools named for this run are available in the lab.
+  local t
+  for t in ${tools[@]+"${tools[@]}"}; do
+    [ -e "$t" ] || die "tool not found: $t"
+    ln -sf "$(cd "$(dirname "$t")" && pwd)/$(basename "$t")" "$BIN/$(basename "$t")"
+  done
+
+  SESSION="lab-$(date +%H%M%S)"
+  # The lab lives in its own tab in the background, so it takes no space and no focus.
+  local out
+  out=$(herdr tab create --cwd "$copy" --label "$SESSION" --no-focus) || die "could not create a tab: $out"
+  OUTER_TAB=$(jq -r '.result.tab.tab_id' <<<"$out")
+  OUTER_PANE=$(jq -r '.result.root_pane.pane_id' <<<"$out")
+  [ -n "$OUTER_PANE" ] && [ "$OUTER_PANE" != null ] || die "could not read the pane id from: $out"
+  printf 'SESSION=%s\nOUTER_TAB=%s\nOUTER_PANE=%s\nCOPY=%s\n' "$SESSION" "$OUTER_TAB" "$OUTER_PANE" "$copy" > "$STATE"
+
+  herdr pane run "$OUTER_PANE" "env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_SESSION -u HERDR_WORKSPACE_ID -u HERDR_TAB_ID -u HERDR_PANE_ID HERDR_CONFIG_PATH=$CONFIG PATH=$BIN:\$PATH herdr --session $SESSION" >/dev/null
+
+  # Do not assume the start worked: wait until the lab's own API answers.
+  local i panes=""
+  for i in $(seq 1 30); do
+    panes=$(lab_herdr pane list 2>/dev/null) && jq -e '.result.panes | length > 0' <<<"$panes" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  if ! jq -e '.result.panes | length > 0' <<<"$panes" >/dev/null 2>&1; then
+    echo "lab: session $SESSION does not answer. Its pane shows:" >&2
+    herdr pane read "$OUTER_PANE" --source recent-unwrapped --lines 15 >&2
+    die "clean up with: lab stop"
+  fi
+  ROOT_PANE=$(jq -r '.result.panes[0].pane_id' <<<"$panes")
+  echo "ROOT_PANE=$ROOT_PANE" >> "$STATE"
+  echo "lab is running: session $SESSION, tab $OUTER_TAB, project copy $copy"
+  echo "tools in the lab: $(ls "$BIN" | tr '\n' ' ')"
+  echo "root pane: $ROOT_PANE"
+}
+
+cmd_hc() {
+  load_state
+  case "${1:-}" in
+    pane|agent|tab|workspace) ;;
+    *) die "in the lab only pane, agent, tab and workspace commands are allowed" ;;
+  esac
+  # The root pane keeps the lab session alive; a check must not close it.
+  if [ "$1 ${2:-}" = "pane close" ] && [ "${3:-}" = "${ROOT_PANE:-}" ]; then die "the root pane $ROOT_PANE must stay open"; fi
+  local out rc
+  out=$(lab_herdr "$@" 2>&1); rc=$?
+  printf '%s\n' "$out"
+  # Everything the lab showed is logged: pane text, and the workspace's own answers
+  # (which panes exist, which agent runs where). The report accepts only quotes found here.
+  case "$1 ${2:-}" in
+    "pane read"|"agent read"|"pane wait-output"|"pane list"|"pane split"|"pane get"|"agent list"|"agent get"|"tab list")
+      printf '%s\n' "$out" >> "$SCREENS" ;;
+  esac
+  return $rc
+}
+
+cmd_status() {
+  load_state
+  echo "session: $SESSION   outer tab: $OUTER_TAB   project copy: $COPY"
+  lab_herdr pane list | jq -r '.result.panes[] | "  \(.pane_id)  agent=\(.agent // "-")  cwd=\(.cwd)"'
+}
+
+cmd_stop() {
+  load_state
+  # Order matters: the lab session first, then its tab, then its files.
+  clean herdr session stop "$SESSION" >/dev/null 2>&1
+  sleep 1
+  clean herdr session delete "$SESSION" >/dev/null 2>&1
+  herdr tab close "$OUTER_TAB" >/dev/null 2>&1
+  rm -rf "$LAB_HOME"
+  # Claude Code keeps a transcript folder per working directory; remove the ones the lab's
+  # own directories created (~/.lab/... becomes -Users-<me>--lab-...).
+  local enc; enc="$(printf '%s' "$LAB_HOME" | tr '/.' '--')"
+  rm -rf "$HOME/.claude/projects/$enc"-*
+  local left=0
+  if clean herdr session list --json | jq -e --arg s "$SESSION" '.sessions[] | select(.name == $s)' >/dev/null 2>&1; then echo "LEFT BEHIND: session $SESSION"; left=1; fi
+  if herdr tab get "$OUTER_TAB" >/dev/null 2>&1; then echo "LEFT BEHIND: tab $OUTER_TAB"; left=1; fi
+  [ -e "$LAB_HOME" ] && { echo "LEFT BEHIND: $LAB_HOME"; left=1; }
+  ls -d "$HOME/.claude/projects/$enc"-* >/dev/null 2>&1 && { echo "LEFT BEHIND: transcripts in ~/.claude/projects/$enc-*"; left=1; }
+  [ $left = 0 ] && echo "lab stopped, nothing left behind."
+  return $left
+}
+
+# Runs one check: a lab agent drives the lab from an empty directory and judges only from the screen.
+run_check() {
+  local title="$1" scenario="$2" report_dir="$3" tester_model="$4" keep="$5" project="$6" agent_model="$7"
+  local started=0
+  if ! running; then
+    if [ -n "$project" ]; then cmd_start --project "$project" --agent-model "$agent_model" || exit 1
+    else cmd_start --agent-model "$agent_model" || exit 1; fi
+    started=1
+  fi
+  load_state
+  : > "$SCREENS"
+  local prompt raw="$LAB_HOME/tester.json"
+  prompt="$(sed -e "s|{{LAB}}|$LAB_DIR/lab|g" -e "s|{{ROOT_PANE}}|$ROOT_PANE|g" "$LAB_DIR/tester.md")
+
+# The check to run: $title
+
+$scenario"
+  echo "lab: the lab agent ($tester_model) is running the check: $title"
+  # Black box: empty directory, no file tools, and Bash only for 'lab hc' commands.
+  ( cd "$LAB_HOME/tester" && claude -p "$prompt" --model "$tester_model" \
+      --setting-sources project,local --strict-mcp-config --disable-slash-commands \
+      --tools Bash --allowedTools "Bash($LAB_DIR/lab hc *)" \
+      --output-format json --json-schema "$(cat "$LAB_DIR/report.schema.json")" ) > "$raw" 2> "$LAB_HOME/tester.err"
+  mkdir -p "$report_dir"
+  local report="$report_dir/$(date +%Y%m%d-%H%M%S)-$(printf '%s' "$title" | tr -cs 'A-Za-z0-9' '-' | tr 'A-Z' 'a-z' | sed 's/^-//; s/-$//' | cut -c1-40).md"
+  python3 -I "$LAB_DIR/report.py" "$raw" "$SCREENS" "$title" "$scenario" "$tester_model" > "$report"
+  local rc=$?
+  cat "$report"
+  echo; echo "report: $report"
+  if [ $started = 1 ] && [ "$keep" = 0 ]; then cmd_stop; fi
+  return $rc
+}
+
+cmd_test() {
+  local file="" n="" tester="sonnet" agent="haiku" keep=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tester-model) tester="${2:?}"; shift 2 ;;
+      --agent-model)  agent="${2:?}"; shift 2 ;;
+      --keep)         keep=1; shift ;;
+      *) if [ -z "$file" ]; then file="$1"; elif [ -z "$n" ]; then n="$1"; else die "unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  [ -f "$file" ] || die "usage: lab test <scenarios.md> <N>   (file not found: ${file:-none})"
+  [ -n "$n" ] || { echo "checks in $file:"; grep -E '^## ' "$file" | sed 's/^## /  /'; exit 0; }
+  local title body
+  title=$(grep -E "^## $n( |$)" "$file" | head -1 | sed 's/^## //')
+  [ -n "$title" ] || die "no check '## $n ...' in $file"
+  body=$(awk -v n="$n" '/^## /{on = ($2 == n)} on && !/^## /' "$file")
+  local dir project=""; dir="$(cd "$(dirname "$file")" && pwd)"
+  git -C "$dir" rev-parse --show-toplevel >/dev/null 2>&1 && project="$(git -C "$dir" rev-parse --show-toplevel)"
+  [ "$project" = "$LAB_DIR" ] && project=""   # the lab's own folder is not a project under test
+  run_check "$title" "$body" "$dir/lab-reports" "$tester" "$keep" "$project" "$agent"
+}
+
+cmd_run() {
+  local text="" tester="sonnet" agent="haiku" keep=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tester-model) tester="${2:?}"; shift 2 ;;
+      --agent-model)  agent="${2:?}"; shift 2 ;;
+      --keep)         keep=1; shift ;;
+      *) text="${text:+$text }$1"; shift ;;
+    esac
+  done
+  [ -n "$text" ] || die 'usage: lab run "<what to try and what to expect>"'
+  run_check "$(printf '%s' "$text" | cut -c1-50)" "$text" "$PWD/lab-reports" "$tester" "$keep" "" "$agent"
+}
+
+case "${1:-}" in
+  doctor) shift; cmd_doctor "$@" ;;
+  start)  shift; cmd_start "$@" ;;
+  hc)     shift; cmd_hc "$@" ;;
+  status) cmd_status ;;
+  test)   shift; cmd_test "$@" ;;
+  run)    shift; cmd_run "$@" ;;
+  stop)   cmd_stop ;;
+  ""|-h|--help|help) cmd_help ;;
+  *) die "unknown command '$1'. See: lab --help" ;;
+esac
