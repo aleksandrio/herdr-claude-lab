@@ -62,7 +62,7 @@ cmd_doctor() {
   check "herdr accepts a lab config with allow_nested"         'd=$(mktemp -d) && printf "[experimental]\nallow_nested = true\n" > "$d/c.toml" && clean HERDR_CONFIG_PATH="$d/c.toml" herdr config check; r=$?; rm -rf "$d"; [ $r = 0 ]'
   if [ "${1:-}" = --login ]; then
     # Costs one tiny model call, so it only runs when asked for.
-    check "claude answers without my user settings (login reused)" 'd=$(mktemp -d) && (cd "$d" && claude -p "Reply with: ok" --model haiku --setting-sources project,local --strict-mcp-config --disable-slash-commands | grep -qi ok); r=$?; rm -rf "$d"; [ $r = 0 ]'
+    check "claude answers without my user settings (login reused)" 'd=$(mktemp -d) && (cd "$d" && DISABLE_AUTOUPDATER=1 claude -p "Reply with: ok" --model haiku --setting-sources project,local --strict-mcp-config --disable-slash-commands | grep -qi ok); r=$?; rm -rf "$d"; [ $r = 0 ]'
   else
     echo "  skip  claude login in the lab (run: lab doctor --login, one small model call)"
   fi
@@ -110,6 +110,9 @@ cmd_start() {
   # A separate CLAUDE_CONFIG_DIR would be cleaner, but then Claude Code is not logged in.
   cat > "$BIN/lab-claude" <<EOF
 #!/usr/bin/env bash
+# Skipping user settings also skips their env block, so the lab must switch auto-update off
+# itself. Without this, a lab harness updated (and broke) the daily Claude Code install.
+export DISABLE_AUTOUPDATER=1
 exec "$(command -v claude)" --setting-sources project,local --strict-mcp-config --model "\${LAB_AGENT_MODEL:-$agent_model}" "\$@"
 EOF
   chmod +x "$BIN/lab-claude"
@@ -215,7 +218,7 @@ run_check() {
 $scenario"
   echo "lab: the lab agent ($tester_model) is running the check: $title"
   # Black box: empty directory, no file tools, and Bash only for 'lab hc' commands.
-  ( cd "$LAB_HOME/tester" && claude -p "$prompt" --model "$tester_model" \
+  ( cd "$LAB_HOME/tester" && DISABLE_AUTOUPDATER=1 claude -p "$prompt" --model "$tester_model" \
       --setting-sources project,local --strict-mcp-config --disable-slash-commands \
       --tools Bash --allowedTools "Bash($LAB_DIR/lab hc *)" \
       --output-format json --json-schema "$(cat "$LAB_DIR/report.schema.json")" ) > "$raw" 2> "$LAB_HOME/tester.err"
